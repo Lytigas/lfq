@@ -4,7 +4,14 @@ version = "0.1.0"
 authors = ["Josh Hejna <josh.hejna@gmail.com>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "A lock-free multi-producer/multi-consumer broadcast queue backed by a ring buffer."
+homepage = "https://github.com/Lytigas/lfq"
+repository = "https://github.com/Lytigas/lfq.git"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+categories = ["concurrency"]
+keywords = ["channel","broadcast","lock-free"]
+
 
 [dependencies]
 

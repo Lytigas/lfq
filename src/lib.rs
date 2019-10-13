@@ -1,4 +1,5 @@
-//! A lock-free, broadcast, multi-producer/multi-consumer queue.
+//! A lock-free multi-producer/multi-consumer broadcast queue backed by a ring
+//! buffer.
 //!
 //! Broadcast means that every reader will read every write.
 //! Read the design section to see if the tradeoffs are right for your
@@ -7,6 +8,10 @@
 //! # Design
 //! For speed reasons, the queue will not ever allocate after initial creation.
 //! Infinite size is emulated via a ring-buffer in a constant size allocation.
+//! To avoid blocking, writers are free to overwrite data that some or all
+//! readers have yet to consume. This means that readers are not guaranteed
+//! to see all writes. As such, this queue is unfit for anything resembling a
+//! task queue. Use `crossbeam-channel` or `bus` for that.
 //!
 //! Multi-consumer and broadcast means that only `Copy` types are supported.
 //!
