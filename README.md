@@ -1,6 +1,6 @@
 # LFQ
 
-[![Crates.io](https://img.shields.io/crates/v/lfq.svg)](https://crates.io/crates/bus)
+[![Crates.io](https://img.shields.io/crates/v/lfq.svg)](https://crates.io/crates/lfq)
 [![Documentation](https://docs.rs/lfq/badge.svg)](https://docs.rs/lfq/)
 
 A lock-free multi-producer/multi-consumer broadcast queue backed by a ring
