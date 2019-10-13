@@ -1,10 +1,77 @@
-//! Queue uses packed atomics to store information about writes, allowing
-//! emulation of an infinite queue in a constant size allocation. This means
-//! that a finite number of writes are supported. After around 2^63 - `size`
-//! writes, information will overlap in the packed atomics, breaking
-//! synchronization in the queue. `size` refers to the allocation size, which
-//! is the requested queue size rounded up to a power of two. Note that his
-//! happens before integer overflow.
+//! A lock-free, broadcast, multi-producer/multi-consumer queue.
+//!
+//! Broadcast means that every reader will read every write.
+//! Read the design section to see if the tradeoffs are right for your
+//! application.
+//!
+//! # Design
+//! For speed reasons, the queue will not ever allocate after initial creation.
+//! Infinite size is emulated via a ring-buffer in a constant size allocation.
+//!
+//! Multi-consumer and broadcast means that only `Copy` types are supported.
+//!
+//! Since streaming readers need to know if writers have overwritten their
+//! place in the buffer, each unit of data and index into the queue has an
+//! associated write "epoch". This data, along with a write-in-progress tag,
+//! is stored into an `AtomicUsize`. For this reason, allocations sizes are
+//! rounded up to a power of two. After around `2^(ptr width) - size`
+//! writes, information will overlap in the packed atomics, breaking the queue
+//! in unpredictable ways. `size` refers to the allocation size, not the
+//! user-requested size. Note that this happens before integer overflow.
+//!
+//! Writes are four step process. First, writers race for the next slot.
+//! The winning writer then initiates the write to the buffer slot with
+//! an atomic store, does the actual write, and then confirms it with another
+//! atomic store. This ensures that readers will never see half-written data,
+//! even if the data is larger than the size of atomic operations on the
+//! platform.
+//!
+//! Readers will check whether the cell they are reading from has an epoch that
+//! matches their index. They will also reject any cells currently undergoing a
+//! write (steps 2-4 above). This means that streaming reads are not guaranteed
+//! to get every message. Moreover, reads of the latest write have to deal with
+//! possibly incomplete writes. Various choices are implemented as public
+//! methods.
+//!
+//! The element type must implement `Default`, as several runtime checks are
+//! eliminated by filling the internal buffer with default data. However, this
+//! temporary data is never read and exists only to avoid `unsafe`.
+//!
+//! The only unsafe code is a `Sync` impl on the internal `Queue` type.
+//!
+//! # Example
+//!
+//! ```
+//! use std::sync::{
+//!     atomic::{AtomicBool, Ordering},
+//!     Arc,
+//! };
+//! use std::thread;
+//! use lfq::QueueClient;
+//!
+//! let w = QueueClient::new_queue(100);
+//! assert_eq!(w.size(), 128);
+//!
+//! let mut r = w.clone();
+//! let messages = w.size() * 20;
+//!
+//! let finished = Arc::new(AtomicBool::new(false));
+//! let stop = finished.clone();
+//! let thread = thread::spawn(move || {
+//!     let mut last = 0;
+//!     while !stop.load(Ordering::Relaxed) {
+//!         let result = r.latest();
+//!         assert!(result >= last);
+//!         last = result;
+//!     }
+//! });
+//!
+//! for data in 0..messages {
+//!     w.push(data);
+//! }
+//! finished.store(true, Ordering::Relaxed);
+//! thread.join().unwrap();
+//! ```
 
 use std::cell::Cell as ICell;
 use std::sync::atomic::{AtomicUsize, Ordering::*};
@@ -13,7 +80,7 @@ use std::usize;
 
 /// Write epochs: 0 represents defualt data, 1 is the first valid write
 #[derive(Debug, Default)]
-pub struct Cell<T: Copy> {
+struct Cell<T: Copy> {
     data: ICell<T>,
     epoch: AtomicUsize,
 }
@@ -59,15 +126,10 @@ impl<T: Copy> Cell<T> {
     pub fn read(&self) -> T {
         self.data.get()
     }
-
-    #[inline]
-    pub fn epoch(&self) -> &AtomicUsize {
-        &self.epoch
-    }
 }
 
 #[derive(Debug)]
-pub struct Queue<T: Copy> {
+struct Queue<T: Copy> {
     data: Box<[Cell<T>]>,
     write_ptr: AtomicUsize,
     idx_mask: usize,
@@ -82,13 +144,17 @@ impl<T: Default + Copy> Queue<T> {
         for _ in 0..size {
             data.push(Default::default());
         }
-        Self {
+        let r = Self {
             data: data.into_boxed_slice(),
             write_ptr: AtomicUsize::new(size), // write epoch 1, idx 0
             idx_mask: size - 1,
-        }
+        };
+        assert_eq!(r.idx_mask + 1, r.data.len());
+        r
     }
+}
 
+impl<T: Copy> Queue<T> {
     #[inline]
     fn size(&self) -> usize {
         self.idx_mask + 1
@@ -129,7 +195,6 @@ impl<T: Default + Copy> Queue<T> {
 
     /// Reads the last value that has a write initiated. Returns `None` if the write has not completed.
     /// Fails if nothing has been written to the queue.
-
     #[inline]
     pub fn try_read_latest(&self) -> Option<T> {
         let idx = self.write_ptr.load(Acquire) - 1;
@@ -137,7 +202,7 @@ impl<T: Default + Copy> Queue<T> {
     }
 
     /// Starts at the most recently initiated write, walking backwards until it finds a successful write.
-    /// Will block indefinitely if nothing has been written to the queue yet.
+    /// Will hang if nothing has been written to the queue yet.
     #[inline]
     pub fn read_latest(&self) -> T {
         let mut idx = self.write_ptr.load(Acquire) - 1;
@@ -193,13 +258,21 @@ unsafe impl<T: Copy> Sync for Queue<T> {}
 
 use std::sync::Arc;
 
+/// A streaming reader and writer holding an`Arc` to a queue buffer.
+///
+/// Use `Clone::clone` to create another reader/writer to the same queue.
+/// The new client will start reading at original's read location at the time
+/// of the clone.
 #[derive(Debug, Clone)]
 pub struct QueueClient<T: Copy> {
     queue: Arc<Queue<T>>,
     to_read: usize,
 }
 
-impl<T: Copy + Default> QueueClient<T> {
+impl<T: Default + Copy> QueueClient<T> {
+    /// Create a new queue and return a client to it. Allocates a buffer of
+    /// `size` rounded up to a power of two. The first element is the next
+    /// to be read.
     pub fn new_queue(size: usize) -> Self {
         let q = Queue::new(size);
         let to_read = q.size();
@@ -208,25 +281,50 @@ impl<T: Copy + Default> QueueClient<T> {
             to_read,
         }
     }
-
-    /// Resets read stream to a valid message with a margin for writes before the next read.
+}
+impl<T: Copy> QueueClient<T> {
+    /// Resets the read stream to a valid message with a margin for writes
+    /// "from behind" before the next read. This usually should not be used;
+    /// `next` uses it internally.
     #[inline]
     pub fn catch_up(&mut self, margin: usize) {
         self.to_read = self.queue.next_write_ptr() - self.queue.size() + margin;
     }
 
+    /// Resets the read stream to the most recently written data. This guarantees
+    /// at least one valid read provided the thread is not pre-empted.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.to_read = self.queue.next_write_ptr() - 1;
+    }
+
+    /// Advances the read pointer `n` elements, faster than calling
+    /// `next` `n` times.
+    #[inline]
+    pub fn skip(&mut self, n: usize) {
+        self.to_read += n;
+    }
+
+    /// The size of the internal buffer. History is readable this far back.
     #[inline]
     pub fn size(&self) -> usize {
         self.queue.size()
     }
 
+    /// Push an element onto the end of the queue.
     #[inline]
     pub fn push(&self, data: T) {
         self.queue.push(data)
     }
 
-    /// May drop messages
-    /// Returns None if all messages have been consumed
+    /// Get the next message if it is still in the history.
+    /// If not, the read pointer is reset to the oldest valid data, skipping
+    /// dropped messages.
+    /// If our reads are racing with a write, more messages are dropped until
+    /// we outpace the writer. This means that in the case of a race, this
+    /// method may block.
+    ///
+    /// Returns `None` the next message has not been written or is currently being written.
     pub fn next(&mut self) -> Option<T> {
         // "backoff" our catch up in case writes are really fast
         let mut margin = 1;
@@ -256,27 +354,93 @@ impl<T: Copy + Default> QueueClient<T> {
         None
     }
 
-    /// May drop messages
-    /// Blocks until there is a message to read
+    /// The same as `next()`, but blocks until there is a newly written
+    /// message to read if we have read all of them.
     #[inline]
     pub fn next_blocking(&mut self) -> T {
         loop {
-            match self.next() {
-                Some(data) => {
-                    return data;
-                }
-                None => (),
+            if let Some(data) = self.next() {
+                return data;
             }
         }
     }
 
+    /// Reads the latest complete write to the queue.
+    ///
+    /// It is possible for a writer to be pre-empted before the write is
+    /// completed. In this case, this method walks backwards from the write
+    /// pointer until it finds the latest completed write. As such, this will
+    /// HANG if no data has been written yet.
     #[inline]
     pub fn latest(&self) -> T {
         self.queue.read_latest()
     }
+
+    /// Selects the most recently earned write (ie: a thread has earned the
+    /// slot, but not necessarily completed the write) and then waits for
+    /// its completion. Use of `latest` is recommended over this method.
+    #[inline]
+    pub fn latest_write(&self) -> T {
+        self.queue.read_latest_blocking()
+    }
+
+    /// Selects the most recently earned write (ie: a thread has earned the
+    /// slot, but not necessarily completed the write) and returns `None` if
+    /// the write has not yet completed.
+    #[inline]
+    pub fn try_latest_write(&self) -> Option<T> {
+        self.queue.try_read_latest()
+    }
+
+    /// Create a blocking iterator from this client. Read the documentation
+    /// on the two `Iterator` implementations before use.
+    pub fn into_iter(self) -> QueueReadIter<T> {
+        QueueReadIter(self)
+    }
 }
 
+/// Note that the iterator `next` is identical to the ordinary `next`. Because
+/// `None` may be yielded, and then `Some` again later, some iterator methods
+/// may not work normally. Use `into_iter()` for an iterator with more reliable
+/// functionality.
+impl<T: Copy> Iterator for QueueClient<T> {
+    type Item = T;
 
+    fn next(&mut self) -> Option<T> {
+        QueueClient::next(self)
+    }
+
+    fn count(self) -> usize {
+        unimplemented!()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<T> {
+        QueueClient::skip(self, n);
+        self.next()
+    }
+}
+
+pub struct QueueReadIter<T: Copy>(QueueClient<T>);
+/// Here, `next` is identical to `QueueClient::next_blocking`. `None` is NEVER
+/// yielded, so `for_each` and similar methods will never terminate.
+impl<T: Copy> Iterator for QueueReadIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        Some(QueueClient::next_blocking(&mut self.0))
+    }
+
+    fn count(self) -> usize {
+        unimplemented!()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<T> {
+        QueueClient::skip(&mut self.0, n);
+        self.next()
+    }
+}
+
+// only has code for these three widths
 #[cfg(any(
     target_pointer_width = "64",
     target_pointer_width = "32",
@@ -341,7 +505,7 @@ mod tests {
 
     impl Chomp {
         fn eat(&mut self, u: u32) {
-            dbg!((u, self.0));
+            // dbg!((u, self.0));
             match self.0 {
                 None => (),
                 Some(x) if x == u - 1 => (),
@@ -419,5 +583,61 @@ mod tests {
         // read 128 back, meaning
         assert_eq!(q2.next(), Some(62 + 500 - 127 + 1));
         assert_eq!(q1.latest(), 62 + 500);
+    }
+
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+    #[test]
+    fn multithreaded_single_producer() {
+        let mut q1 = QueueClient::<u32>::new_queue(4000);
+        let mut q2 = q1.clone();
+        let q3 = q1.clone();
+        let q4 = q1.clone();
+
+        let messages = q1.size() * 20;
+        let write_delay = 25; // nanos
+
+        // simple reader
+        let t1 = thread::spawn(move || {
+            let mut c1 = Chomp::default();
+            for _ in 0..messages {
+                c1.eat(q1.next_blocking());
+            }
+        });
+        // reader joins late and will "catch up"
+        let t2 = thread::spawn(move || {
+            let mut c2 = Chomp::default();
+            let skip_first = (q2.size() as u64) * 5;
+            thread::sleep(Duration::from_nanos(write_delay * skip_first));
+            let skip_first = skip_first * 3 / 2; //1.5x margin to ensure we don't just deadlock
+            for _ in 0..(messages - skip_first as usize) {
+                c2.eat(q2.next_blocking());
+            }
+        });
+        // reader ensures latest is at least monotonic
+        let end_thread = Arc::new(AtomicBool::new(false));
+        let stop = end_thread.clone();
+        let t3 = thread::spawn(move || {
+            let mut last = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let r = q3.latest();
+                assert!(r >= last, "{} >= {}", r, last);
+                last = r;
+            }
+        });
+
+        for data in 0..messages {
+            q4.push(data as u32);
+            thread::sleep(Duration::from_nanos(write_delay));
+        }
+
+        end_thread.store(true, Ordering::Relaxed);
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
     }
 }
