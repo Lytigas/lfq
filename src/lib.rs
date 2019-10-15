@@ -79,8 +79,23 @@
 //! ```
 
 use std::cell::Cell as ICell;
-use std::sync::atomic::{AtomicUsize, Ordering::*};
+use std::sync::atomic::Ordering::*;
 use std::usize;
+
+#[cfg(not(test))]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(test)]
+use loom::sync::atomic::AtomicUsize;
+
+#[cfg(not(test))]
+fn loom_yield() {}
+
+#[cfg(test)]
+fn loom_yield() {
+    loom::thread::yield_now();
+}
+
 // https://github.com/rust-lang/rfcs/blob/master/text/1443-extended-compare-and-swap.md
 
 /// Write epochs: 0 represents defualt data, 1 is the first valid write
@@ -120,7 +135,10 @@ impl<T: Copy> Cell<T> {
                 // if any race occurs, there's a chance for a deadlock here
                 // ensure the epoch we are trying to advance from comes before us
                 // if not, we will be stuck in a loop forever and have big problems
-                Err(x) => debug_assert!(x & !SENTINEL_MASK <= old_epoch),
+                Err(x) => {
+                    debug_assert!(x & !SENTINEL_MASK <= old_epoch);
+                    loom_yield();
+                }
             }
         }
         self.data.set(dat);
@@ -191,7 +209,7 @@ impl<T: Copy> Queue<T> {
                 .compare_exchange_weak(old, new, SeqCst, Relaxed) // Could maybe improve the success ordering
             {
                 Ok(_) => break,
-                Err(x) => old = x,
+                Err(x) => {old = x; loom_yield();},
             }
         }
         // now we can write our data into old
@@ -218,6 +236,7 @@ impl<T: Copy> Queue<T> {
                 }
                 Err(_epoch) => {
                     idx -= 1;
+                    loom_yield();
                 }
             }
         }
@@ -232,7 +251,7 @@ impl<T: Copy> Queue<T> {
                 Ok(data) => {
                     return data;
                 }
-                Err(_epoch) => (),
+                Err(_epoch) => loom_yield(),
             }
         }
     }
@@ -367,6 +386,7 @@ impl<T: Copy> QueueClient<T> {
             if let Some(data) = self.next() {
                 return data;
             }
+            loom_yield();
         }
     }
 
@@ -513,7 +533,7 @@ mod tests {
             // dbg!((u, self.0));
             match self.0 {
                 None => (),
-                Some(x) if x == u - 1 => (),
+                Some(x) if x < u => (),
                 Some(_) => panic!(),
             }
             self.0 = Some(u);
@@ -590,59 +610,63 @@ mod tests {
         assert_eq!(q1.latest(), 62 + 500);
     }
 
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-    use std::thread;
+    use loom::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    // use std::thread;
+    use loom::thread;
     use std::time::Duration;
     #[test]
     fn multithreaded_single_producer() {
-        let mut q1 = QueueClient::<u32>::new_queue(4000);
-        let mut q2 = q1.clone();
-        let q3 = q1.clone();
-        let q4 = q1.clone();
+        loom::model(|| {
+            let mut q1 = QueueClient::<u32>::new_queue(10);
+            let mut q2 = q1.clone();
+            let q3 = q1.clone();
+            let q4 = q1.clone();
 
-        let messages = q1.size() * 20;
-        let write_delay = 25; // nanos
+            let messages = q1.size() * 5;
+            let write_delay = 25; // nanos
 
-        // simple reader
-        let t1 = thread::spawn(move || {
-            let mut c1 = Chomp::default();
-            for _ in 0..messages {
-                c1.eat(q1.next_blocking());
+            q4.push(0);
+
+            // // simple reader
+            // let t1 = thread::spawn(move || {
+            //     let mut c1 = Chomp::default();
+            //     for _ in 0..messages {
+            //         c1.eat(q1.next_blocking());
+            //     }
+            // });
+            // // reader joins late and will "catch up"
+            // let t2 = thread::spawn(move || {
+            //     let mut c2 = Chomp::default();
+            //     let skip_first = (q2.size() as u64) * 5;
+            //     // thread::sleep(Duration::from_nanos(write_delay * skip_first));
+            //     let skip_first = skip_first * 3 / 2; //1.5x margin to ensure we don't just deadlock
+            //     for _ in 0..(messages - skip_first as usize) {
+            //         c2.eat(q2.next_blocking());
+            //     }
+            // });
+            // reader ensures latest is at least monotonic
+            let end_thread = Arc::new(AtomicBool::new(false));
+            let stop = end_thread.clone();
+            let t3 = thread::spawn(move || {
+                let mut last = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let r = q3.latest();
+                    assert!(r >= last, "{} >= {}", r, last);
+                    last = r;
+                }
+            });
+
+            for data in 0..messages {
+                q4.push(data as u32);
+                // thread::sleep(Duration::from_nanos(write_delay));
             }
-        });
-        // reader joins late and will "catch up"
-        let t2 = thread::spawn(move || {
-            let mut c2 = Chomp::default();
-            let skip_first = (q2.size() as u64) * 5;
-            thread::sleep(Duration::from_nanos(write_delay * skip_first));
-            let skip_first = skip_first * 3 / 2; //1.5x margin to ensure we don't just deadlock
-            for _ in 0..(messages - skip_first as usize) {
-                c2.eat(q2.next_blocking());
-            }
-        });
-        // reader ensures latest is at least monotonic
-        let end_thread = Arc::new(AtomicBool::new(false));
-        let stop = end_thread.clone();
-        let t3 = thread::spawn(move || {
-            let mut last = 0;
-            while !stop.load(Ordering::Relaxed) {
-                let r = q3.latest();
-                assert!(r >= last, "{} >= {}", r, last);
-                last = r;
-            }
-        });
 
-        for data in 0..messages {
-            q4.push(data as u32);
-            thread::sleep(Duration::from_nanos(write_delay));
-        }
-
-        end_thread.store(true, Ordering::Relaxed);
-        t1.join().unwrap();
-        t2.join().unwrap();
-        t3.join().unwrap();
+            end_thread.store(true, Ordering::Relaxed);
+            // t1.join().unwrap();
+            // t2.join().unwrap();
+            t3.join().unwrap();
+        });
     }
 }

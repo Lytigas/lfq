@@ -17,6 +17,7 @@ keywords = ["channel","broadcast","lock-free"]
 
 [dev-dependencies]
 criterion = "0.3"
+loom = "0.2.9"
 
 [[bench]]
 path = "benches/throughput.rs"
