@@ -106,6 +106,7 @@ impl<T: Copy> Cell<T> {
         // downside: newer writes can't "kick" off old writers
         // though, a sufficiently large queue will ensure this basically never happens as long
         // as each writer gets a chance to run
+        // However, in the case of RT tasks starving non-RT tasks, this could happen
 
         let old_epoch = new_epoch - epoch_increment;
         loop {
@@ -123,6 +124,8 @@ impl<T: Copy> Cell<T> {
                 Err(x) => debug_assert!(x & !SENTINEL_MASK <= old_epoch),
             }
         }
+        // If a thread dies before storing the new_epoch value, then this slot can never be overwritten and will deadlock readers the entire queue
+        // TODO: see if we can recover from this
         self.data.set(dat);
         self.epoch.store(new_epoch, Release);
     }
@@ -135,8 +138,12 @@ impl<T: Copy> Cell<T> {
 
 #[derive(Debug)]
 struct Queue<T: Copy> {
+    /// Heap array storing the actual slots
     data: Box<[Cell<T>]>,
+    /// An index representing an "virtual" "absolute" index, which is wrapped into an actual index in memory.
+    /// Represents the next cell to be written, so a successful CAS loop uses the old value as the write index.
     write_ptr: AtomicUsize,
+    /// A bitmask. write_ptr & idx_mask gives an index into `data`
     idx_mask: usize,
 }
 
@@ -155,6 +162,7 @@ impl<T: Default + Copy> Queue<T> {
             idx_mask: size - 1,
         };
         assert_eq!(r.idx_mask + 1, r.data.len());
+        assert_eq!(size, r.data.len());
         r
     }
 }
@@ -207,7 +215,9 @@ impl<T: Copy> Queue<T> {
     }
 
     /// Starts at the most recently initiated write, walking backwards until it finds a successful write.
-    /// Will hang if nothing has been written to the queue yet.
+    /// Will integer underflow and read OOB if nothing has been written to the queue yet.
+    /// Another possible failure mode is that literally every slot is currently being written to
+    /// (imagine 5 writers on a queue of size 2). The same OOB read will occur.
     #[inline]
     pub fn read_latest(&self) -> T {
         let mut idx = self.write_ptr.load(Acquire) - 1;
@@ -223,7 +233,7 @@ impl<T: Copy> Queue<T> {
         }
     }
 
-    /// Waits for the most recently initiated write to complete. Will not chase new writes after inovacation.
+    /// Busy waits for the most recently initiated write to complete. Will not chase new writes after inovacation.
     #[inline]
     pub fn read_latest_blocking(&self) -> T {
         let idx = self.write_ptr.load(Acquire) - 1;
@@ -258,7 +268,7 @@ impl<T: Copy> Queue<T> {
     }
 }
 
-// The way Queue writes to Cell guarantees no data races
+// The way Queue writes to Cell, the constraints used in `read`, guarantees no data races
 unsafe impl<T: Copy> Sync for Queue<T> {}
 
 use std::sync::Arc;
@@ -327,10 +337,14 @@ impl<T: Copy> QueueClient<T> {
     /// dropped messages.
     /// If our reads are racing with a write, more messages are dropped until
     /// we outpace the writer. This means that in the case of a race, this
-    /// method may block.
+    /// method may pseudo-busy-wait.
     ///
-    /// Returns `None` the next message has not been written or is currently being written.
-    pub fn next(&mut self) -> Option<T> {
+    /// The second element of tuple is how many messages were dropped.
+    ///
+    /// Returns `None` if the next message has not been written or is currently being written.
+    #[inline]
+    pub fn next(&mut self) -> Option<(T, usize)> {
+        let old_to_read = self.to_read;
         // "backoff" our catch up in case writes are really fast
         let mut margin = 1;
         let size = self.queue.size();
@@ -338,7 +352,7 @@ impl<T: Copy> QueueClient<T> {
             match self.queue.read(self.to_read) {
                 Ok(data) => {
                     self.to_read += 1;
-                    return Some(data);
+                    return Some((data, self.to_read - old_to_read - 1));
                 }
                 Err(epoch) => {
                     // first handle the case of a write
@@ -346,6 +360,8 @@ impl<T: Copy> QueueClient<T> {
                     let epoch = epoch & !SENTINEL_MASK;
                     if epoch <= self.queue.epoch(self.to_read) || write_in_progress {
                         // either, we are trying to read ahead, or trying to read data that is currently being written
+                        // TODO: separately handle the case of a write in progress, and skip over it,
+                        // Allowing us to sort of recover in the case of a dead writer
                         return None;
                     } else {
                         // this means data_epoch > read_epoch, so the writers have overtaken us
@@ -359,10 +375,10 @@ impl<T: Copy> QueueClient<T> {
         None
     }
 
-    /// The same as `next()`, but blocks until there is a newly written
+    /// The same as `next()`, but busy-waits until there is a newly written
     /// message to read if we have read all of them.
     #[inline]
-    pub fn next_blocking(&mut self) -> T {
+    pub fn next_blocking(&mut self) -> (T, usize) {
         loop {
             if let Some(data) = self.next() {
                 return data;
@@ -375,7 +391,7 @@ impl<T: Copy> QueueClient<T> {
     /// It is possible for a writer to be pre-empted before the write is
     /// completed. In this case, this method walks backwards from the write
     /// pointer until it finds the latest completed write. As such, this will
-    /// HANG if no data has been written yet.
+    /// read OOB if no data has been written yet.
     #[inline]
     pub fn latest(&self) -> T {
         self.queue.read_latest()
@@ -404,6 +420,17 @@ impl<T: Copy> QueueClient<T> {
     }
 }
 
+trait GetFirst<T> {
+    fn first(self) -> Option<T>;
+}
+
+impl<T, U> GetFirst<T> for Option<(T, U)> {
+    #[inline]
+    fn first(self) -> Option<T> {
+        self.map(|(t, _u)| t)
+    }
+}
+
 /// Note that the iterator `next` is identical to the ordinary `next`. Because
 /// `None` may be yielded, and then `Some` again later, some iterator methods
 /// may not work normally. Use `into_iter()` for an iterator with more reliable
@@ -412,7 +439,7 @@ impl<T: Copy> Iterator for QueueClient<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        QueueClient::next(self)
+        QueueClient::next(self).first()
     }
 
     fn count(self) -> usize {
@@ -421,7 +448,7 @@ impl<T: Copy> Iterator for QueueClient<T> {
 
     fn nth(&mut self, n: usize) -> Option<T> {
         QueueClient::skip(self, n);
-        self.next()
+        <Self as Iterator>::next(self)
     }
 }
 
@@ -432,7 +459,7 @@ impl<T: Copy> Iterator for QueueReadIter<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        Some(QueueClient::next_blocking(&mut self.0))
+        Some(QueueClient::next_blocking(&mut self.0).0)
     }
 
     fn count(self) -> usize {
@@ -528,7 +555,7 @@ mod tests {
 
     fn read(q: &mut QueueClient<u32>, ch: &mut Chomp, n: u32) {
         for _ in 0..n {
-            ch.eat(q.next_blocking());
+            ch.eat(q.next_blocking().0);
         }
     }
 
@@ -586,7 +613,7 @@ mod tests {
         // 562 written so far
         // default read margin is 1
         // read 128 back, meaning
-        assert_eq!(q2.next(), Some(62 + 500 - 127 + 1));
+        assert_eq!(q2.next().first(), Some(62 + 500 - 127 + 1));
         assert_eq!(q1.latest(), 62 + 500);
     }
 
@@ -610,7 +637,7 @@ mod tests {
         let t1 = thread::spawn(move || {
             let mut c1 = Chomp::default();
             for _ in 0..messages {
-                c1.eat(q1.next_blocking());
+                c1.eat(q1.next_blocking().0);
             }
         });
         // reader joins late and will "catch up"
@@ -620,7 +647,7 @@ mod tests {
             thread::sleep(Duration::from_nanos(write_delay * skip_first));
             let skip_first = skip_first * 3 / 2; //1.5x margin to ensure we don't just deadlock
             for _ in 0..(messages - skip_first as usize) {
-                c2.eat(q2.next_blocking());
+                c2.eat(q2.next_blocking().0);
             }
         });
         // reader ensures latest is at least monotonic
