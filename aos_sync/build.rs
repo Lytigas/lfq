@@ -4,7 +4,8 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .file("cpp/aos/ipc_lib/aos_sync.cc")
         .file("cpp/aos/libc/aos_strerror.cc")
         .include("cpp")
@@ -15,11 +16,15 @@ fn main() {
         .flag("-Wno-unused-variable")
         // .warnings_extra(true)
         .static_flag(true)
-        .cargo_metadata(true)
-        .compile("aos_sync");
+        .cargo_metadata(true);
+
+    // if cfg!(feature = "thinlto") {
+    //     build.flag("-flto=thin");
+    // }
+    build.compile("aos_sync");
 
     println!("cargo:rerun-if-changed=cpp/aos/ipc_lib/aos_sync.h");
-    println!("cargo:rerun-if-changed=cpp/aos_sync.cc");
+    println!("cargo:rerun-if-changed=cpp/aos/ipc_lib/aos_sync.cc");
 
     let bindings = bindgen::Builder::default()
         .header("cpp/aos/ipc_lib/aos_sync.h")

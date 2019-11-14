@@ -9,6 +9,9 @@ edition = "2018"
 
 [dependencies]
 
+# [features]
+# thinlto = []
+
 [build-dependencies]
 cc = "1.0"
 bindgen = "0.51"
